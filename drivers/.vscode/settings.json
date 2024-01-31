@@ -1,0 +1,20 @@
+{
+    "files.associations": {
+        "fastswap_rdma.h": "c",
+        "module.h": "c",
+        "inet.h": "c",
+        "rdma_cm.h": "c",
+        "ib_verbs.h": "c",
+        "list.h": "c",
+        "mm_types.h": "c",
+        "gfp.h": "c",
+        "spinlock.h": "c",
+        "pagemap.h": "c",
+        "rbtree.h": "c",
+        "crypto.h": "c",
+        "compare": "c",
+        "type_traits": "c",
+        "limits": "c",
+        "vmalloc.h": "c"
+    }
+}

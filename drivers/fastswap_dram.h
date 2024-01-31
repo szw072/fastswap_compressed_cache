@@ -5,9 +5,9 @@
 #include <linux/vmalloc.h>
 
 
-int sswap_rdma_read_async(struct page *page, u64 roffset);
+int sswap_rdma_read_async(struct page *page, u64 roffset);//直接使用只要 EXPORT_SYMBOL(sswap_rdma_read_async);即可
 int sswap_rdma_read_sync(struct page *page, u64 roffset);
-int sswap_rdma_write(struct page *page, u64 roffset);
+int sswap_rdma_write(unsigned type, struct page *page, u64 roffset)
 int sswap_rdma_poll_load(int cpu);
 int sswap_rdma_drain_loads_sync(int cpu, int target);
 

@@ -9,7 +9,7 @@
 
 static void *drambuf;
 
-int sswap_rdma_write(struct page *page, u64 roffset)
+int sswap_rdma_write(unsigned type, struct page *page, u64 roffset)
 {
 	void *page_vaddr;
 
@@ -66,7 +66,7 @@ static int __init sswap_dram_init_module(void)
 	pr_info("start: %s\n", __FUNCTION__);
 	pr_info("will use new DRAM backend");
 
-	drambuf = vzalloc(REMOTE_BUF_SIZE);
+	drambuf = vzalloc(REMOTE_BUF_SIZE);//同vmalloc
 	pr_info("vzalloc'ed %lu bytes for dram backend\n", REMOTE_BUF_SIZE);
 
 	pr_info("DRAM backend is ready for reqs\n");

@@ -17,10 +17,10 @@
 #error "Need to define BACKEND flag"
 #endif
 
-#if BACKEND == B_DRAM
+#if BACKEND == B_DRAM //1
 #define DRAM
-#include "fastswap_dram.h"
-#elif BACKEND == B_RDMA
+#include "fastswap_dram.h"//根据arg参数 选择不同的函数实现 rdma/DRAM
+#elif BACKEND == B_RDMA //2
 #define RDMA
 #include "fastswap_rdma.h"
 #else
@@ -30,7 +30,7 @@
 static int sswap_store(unsigned type, pgoff_t pageid,
         struct page *page)
 {
-  if (sswap_rdma_write(page, pageid << PAGE_SHIFT)) {
+  if (sswap_rdma_write(type ,page, pageid << PAGE_SHIFT)) {
     pr_err("could not store page remotely\n");
     return -1;
   }
@@ -54,7 +54,7 @@ static int sswap_load_async(unsigned type, pgoff_t pageid, struct page *page)
 
 static int sswap_load(unsigned type, pgoff_t pageid, struct page *page)
 {
-  if (unlikely(sswap_rdma_read_sync(page, pageid << PAGE_SHIFT))) {
+  if (unlikely(sswap_rdma_read_sync(page, pageid << PAGE_SHIFT))) {//sync = async
     pr_err("could not read page remotely\n");
     return -1;
   }
@@ -79,6 +79,7 @@ static void sswap_invalidate_area(unsigned type)
 
 static void sswap_init(unsigned type)
 {
+  // sswap_rdma_init(type);//初始化rb tree
   pr_info("sswap_init end\n");
 }
 
