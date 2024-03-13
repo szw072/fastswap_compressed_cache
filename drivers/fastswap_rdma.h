@@ -38,7 +38,8 @@ struct rdma_req {//信息:1.cqe设置完成done函数 2.dma地址 3.page
   struct page *page;
   size_t len;//+++
   void* src;//+++用于存读时的缓存位置 用于解压缩
-  u64 roffset;
+  u64 roffset;//+++
+  u16 crc; //+++用于crc校验
 };
 
 struct sswap_rdma_ctrl;
@@ -83,7 +84,7 @@ struct rdma_queue *sswap_rdma_get_queue(unsigned int idx, enum qp_type type);
 enum qp_type get_queue_type(unsigned int idx);
 int sswap_rdma_read_async(struct page *page, u64 roffset);
 int sswap_rdma_read_sync(struct page *page, u64 roffset);
-int sswap_rdma_write(unsigned type, struct page *page, u64 roffset);//加type
+int sswap_rdma_write(struct page *page, u64 roffset);//
 int sswap_rdma_poll_load(int cpu);
 
 void sswap_rdma_init(unsigned type);

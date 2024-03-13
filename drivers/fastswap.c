@@ -17,10 +17,10 @@
 #error "Need to define BACKEND flag"
 #endif
 
-#if BACKEND == B_DRAM //1
+#if BACKEND == B_DRAM //1 CFLAGS_fastswap.o=-DBACKEND=1
 #define DRAM
 #include "fastswap_dram.h"//根据arg参数 选择不同的函数实现 rdma/DRAM
-#elif BACKEND == B_RDMA //2
+#elif BACKEND == B_RDMA //2 CFLAGS_fastswap.o=-DBACKEND=2
 #define RDMA
 #include "fastswap_rdma.h"
 #else
@@ -30,10 +30,14 @@
 static int sswap_store(unsigned type, pgoff_t pageid,
         struct page *page)
 {
-  if (sswap_rdma_write(type ,page, pageid << PAGE_SHIFT)) {
+  u64 roffset = pageid << PAGE_SHIFT;
+  pr_info("[write] roffset: %llx", roffset);//在sswap_store中输出
+  if (sswap_rdma_write(page, pageid << PAGE_SHIFT)) {
     pr_err("could not store page remotely\n");
     return -1;
   }
+  
+
 
   return 0;
 }
