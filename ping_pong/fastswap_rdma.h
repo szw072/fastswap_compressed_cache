@@ -11,7 +11,10 @@
 #include <linux/pagemap.h>
 #include <linux/spinlock.h>
 
-
+enum req_type{
+  PINGPONG,
+  PINGPONG_COMPRESS
+};
 
 enum qp_type {
   QP_READ_SYNC,
@@ -32,6 +35,7 @@ struct rdma_req {
   struct page *page;
   int len;//+++
   void *src;//+++
+  enum req_type req_type;//+++ 增加请求类型 用于不同的done处理
 };
 
 struct sswap_rdma_ctrl;

@@ -62,7 +62,7 @@ static int decompress(void* src,int slen, void *dst, unsigned int *dlen){
 		pr_err("could not alloc crypto comp");
 		return -ENOMEM;
 	}
-  ret = crypto_comp_decompress(tfm, src, slen, dst, dlen);
+  ret = crypto_comp_decompress(tfm, (u8 *)src, slen, (u8 *)dst, dlen);
     // pr_info("[decompress] length %d", dlen);
   // if((*dlen) != 4096){//如果解压缩大小不是4KB 触发BUG
   //   pr_info("decompress wrong! len: %d --> %u", slen, *dlen);
@@ -533,17 +533,58 @@ static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
   kmem_cache_free(req_cache, req);
 }
 
+
+
+//测试不使用decompress函数 tmd还真是decompress函数的问题 在done中无法正常解压缩 ret = -22
 static void sswap_rdma_read_buf_done(struct ib_cq *cq, struct ib_wc *wc)
 {
   struct rdma_req *req =
     container_of(wc->wr_cqe, struct rdma_req, cqe);
   struct rdma_queue *q = cq->cq_context;
   struct ib_device *ibdev = q->ctrl->rdev->dev;
+  u16 crc_r, crc_r_decompress;
+  int dlen;
+  void *dst;
+  int decompress_ret;
+
+  struct crypto_comp *tfm;
+  char alg[] = "lzo";
+
+
+
 
   if (unlikely(wc->status != IB_WC_SUCCESS))
     pr_err("sswap_rdma_read_done status is not success, it is=%d\n", wc->status);
 
   ib_dma_unmap_single(ibdev, req->dma, req->len, DMA_FROM_DEVICE);
+
+  //******** 按req类型处理 **************
+  switch(req->req_type){
+    case PINGPONG:
+      pr_info("[done] %s", (char *)req->src);
+      break;
+    case PINGPONG_COMPRESS:
+      // dst = kmalloc(2 * PAGE_SIZE, GFP_KERNEL);
+      dst = kmalloc(2 * 4096, GFP_KERNEL);
+      crc_r = crc16(0x0000, req->src, req->len);
+      // decompress_ret = decompress(req->src, req->len, dst, &dlen);
+
+      //******** 解压缩 **************
+      tfm = crypto_alloc_comp(alg,0,0);
+      if (IS_ERR_OR_NULL(tfm)) {
+        pr_err("could not alloc crypto comp");
+        BUG();
+      }
+      decompress_ret = crypto_comp_decompress(tfm, req->src, req->len, dst, &dlen);      
+      crypto_free_comp(tfm);//释放crypto_comp对象
+
+      
+      crc_r_decompress = crc16(0x0000, dst, dlen);
+      pr_info("[done] decompress len: %d --> %d crc: %d --> %d ret: %d", req->len, dlen, crc_r, crc_r_decompress, decompress_ret);
+      pr_info("decompress addr: %p len: %d", req->src, req->len);
+      kfree(dst);
+      break;
+  }
 
   // SetPageUptodate(req->page);
   // unlock_page(req->page);
@@ -973,7 +1014,7 @@ static void compress_test(void){
 
 	compress(src, buflen, buf, &dlen);//默认page_size  
 
-	pr_info("first crc: %d compress len: %u", crc_w, dlen);
+	pr_info("first crc: %d compress len: %d --> %u", crc_w, buflen, dlen);
     
 
 	
@@ -984,7 +1025,7 @@ static void compress_test(void){
 
 
 	// pr_info("random number: %d", a);
-	pr_info("second crc: %d decompress len: %u", crc_r, slen);
+	pr_info("second crc: %d decompress len: %d --> %u", crc_r, dlen, slen);
 	
 	// src = (u8 *)kmalloc(2, GFP_KERNEL);
 	
@@ -1065,14 +1106,16 @@ static int pingpong_test(void){
   if (unlikely(ret))
     return ret;
   req_read->len = buflen;
+  req_read->req_type = PINGPONG;
+  req_read->src = dst;//+++ 用于done中读
   req_read->cqe.done = sswap_rdma_read_buf_done;
   ret = sswap_rdma_post_rdma(q_read, req_read, &sge, roffset, IB_WR_RDMA_READ);
   
   drain_queue(q_read);
 
-  sswap_rdma_wait_completion(q_read->cq, req_read);//等待read_done 完成
+  sswap_rdma_wait_completion(q_read->cq, req_read);//等待read_done 完成 complete(&req->done);
 
-  pr_info("%s", (char *)dst);
+  pr_info("[done back] %s", (char *)dst);
 
   kfree(src);
   kfree(dst);
@@ -1088,10 +1131,10 @@ static int pingpong_test_compress(void){
   struct ib_sge sge = {};
   int inflight, buflen;
   void *src, *dst, *buf_read, *buf_write;
-  u16 crc_write, crc_read;
+  u16 crc_w_compress, crc_r_decompress;
   u16 crc_w, crc_r;
   int dlen, slen;
-
+  //crc_w --> crc_w_compress --> crc_r --> crc_r_decompress
 
   u64 roffset = 0x0;
 
@@ -1111,7 +1154,7 @@ static int pingpong_test_compress(void){
 
   crc_w = crc16(0x0000, src, buflen);
   compress(src, buflen, buf_write, &dlen);// buflen --> dlen
-  crc_write = crc16(0x0000, buf_write, dlen);
+  crc_w_compress = crc16(0x0000, buf_write, dlen);
 
   // pr_info("random num:");
   // p = (char *)src;
@@ -1119,8 +1162,7 @@ static int pingpong_test_compress(void){
   //   printk("%02X ", p[i]);
   // }
   // printk("\n");
-  pr_info("uncompress len: %d crc: %hx", buflen, crc_w);
-  pr_info("write compress len: %d crc: %hx", dlen, crc_write);
+  pr_info("compress len: %d --> %d crc: %d --> %d", buflen, dlen, crc_w, crc_w_compress);
 
   // q_write = sswap_rdma_get_queue(smp_processor_id(), QP_WRITE_SYNC);
   // q_read = sswap_rdma_get_queue(smp_processor_id(), QP_READ_SYNC);
@@ -1163,7 +1205,9 @@ static int pingpong_test_compress(void){
   ret = get_req_for_buf(&req_read, dev, buf_read, dlen, DMA_FROM_DEVICE);
   if (unlikely(ret))
     return ret;
-  req_read->len = dlen;
+  req_read->len = dlen;//+++ 压缩后长度
+  req_read->src = buf_read;//+++
+  req_read->req_type = PINGPONG_COMPRESS;//+++
   req_read->cqe.done = sswap_rdma_read_buf_done;
   ret = sswap_rdma_post_rdma(q_read, req_read, &sge, roffset, IB_WR_RDMA_READ);
   
@@ -1175,17 +1219,15 @@ static int pingpong_test_compress(void){
 
   // pr_info("************************");
 
-  crc_read = crc16(0x0000, buf_read, dlen);
+  crc_r = crc16(0x0000, buf_read, dlen);
   //buflen -> dlen -> slen
   decompress(buf_read, dlen, dst, &slen);
 
-  crc_r = crc16(0x0000, dst, slen);
+  crc_r_decompress = crc16(0x0000, dst, slen);
 
   // pr_info("crc: %hx", crc_read);
-
-  pr_info("read compress len: %d crc: %hx", dlen, crc_read);
-
-  pr_info("decompress len: %d crc: %hx", slen, crc_r);
+  pr_info("[done back] decompress len: %d --> %d crc: %d --> %d", dlen, slen, crc_r, crc_r_decompress);
+  pr_info("decompress addr: %p, len: %d", buf_read, dlen);
 
 
 
