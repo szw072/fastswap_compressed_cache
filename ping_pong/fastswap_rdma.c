@@ -580,10 +580,32 @@ static void sswap_rdma_read_buf_done(struct ib_cq *cq, struct ib_wc *wc)
 
       
       crc_r_decompress = crc16(0x0000, dst, dlen);
-      pr_info("[done] decompress len: %d --> %d crc: %d --> %d ret: %d", req->len, dlen, crc_r, crc_r_decompress, decompress_ret);
-      pr_info("decompress addr: %p len: %d", req->src, req->len);
+      pr_info("[done] decompress len: %d --> %d crc: %hx --> %hx ret: %d", req->len, dlen, crc_r, crc_r_decompress, decompress_ret);
+      // pr_info("decompress addr: %p len: %d", req->src, req->len);
       kfree(dst);
       break;
+    case PINGPONG_COMPRESS_PAGE:
+      dst = kmap_atomic(req->page);
+      crc_r = crc16(0x0000, req->src, req->len);
+      // decompress_ret = decompress(req->src, req->len, dst, &dlen);
+
+      //******** 解压缩 **************
+      tfm = crypto_alloc_comp(alg,0,0);
+      if (IS_ERR_OR_NULL(tfm)) {
+        pr_err("could not alloc crypto comp");
+        BUG();
+      }
+      decompress_ret = crypto_comp_decompress(tfm, req->src, req->len, dst, &dlen);      
+      crypto_free_comp(tfm);//释放crypto_comp对象
+
+      
+      crc_r_decompress = crc16(0x0000, dst, dlen);
+      pr_info("[done] decompress len: %d --> %d crc: %hx --> %hx ret: %d", req->len, dlen, crc_r, crc_r_decompress, decompress_ret);
+      // pr_info("decompress addr: %p len: %d", req->src, req->len);
+      kunmap_atomic(dst);
+      break;
+
+
   }
 
   // SetPageUptodate(req->page);
@@ -1014,7 +1036,7 @@ static void compress_test(void){
 
 	compress(src, buflen, buf, &dlen);//默认page_size  
 
-	pr_info("first crc: %d compress len: %d --> %u", crc_w, buflen, dlen);
+	pr_info("first crc: %hx compress len: %d --> %u", crc_w, buflen, dlen);
     
 
 	
@@ -1025,7 +1047,7 @@ static void compress_test(void){
 
 
 	// pr_info("random number: %d", a);
-	pr_info("second crc: %d decompress len: %d --> %u", crc_r, dlen, slen);
+	pr_info("second crc: %hx decompress len: %d --> %u", crc_r, dlen, slen);
 	
 	// src = (u8 *)kmalloc(2, GFP_KERNEL);
 	
@@ -1162,7 +1184,7 @@ static int pingpong_test_compress(void){
   //   printk("%02X ", p[i]);
   // }
   // printk("\n");
-  pr_info("compress len: %d --> %d crc: %d --> %d", buflen, dlen, crc_w, crc_w_compress);
+  pr_info("compress len: %d --> %d crc: %hx --> %hx", buflen, dlen, crc_w, crc_w_compress);
 
   // q_write = sswap_rdma_get_queue(smp_processor_id(), QP_WRITE_SYNC);
   // q_read = sswap_rdma_get_queue(smp_processor_id(), QP_READ_SYNC);
@@ -1226,8 +1248,8 @@ static int pingpong_test_compress(void){
   crc_r_decompress = crc16(0x0000, dst, slen);
 
   // pr_info("crc: %hx", crc_read);
-  pr_info("[done back] decompress len: %d --> %d crc: %d --> %d", dlen, slen, crc_r, crc_r_decompress);
-  pr_info("decompress addr: %p, len: %d", buf_read, dlen);
+  pr_info("[done back] decompress len: %d --> %d crc: %hx --> %hx", dlen, slen, crc_r, crc_r_decompress);
+  // pr_info("decompress addr: %p, len: %d", buf_read, dlen);
 
 
 
@@ -1249,10 +1271,163 @@ out:
 }
 
 
+
+
+
+static int pingpong_test_compress_page(void){
+  int ret;
+  struct rdma_queue *q_read, *q_write;
+  struct rdma_req *req_write, *req_read;
+  struct ib_device *dev;
+  struct ib_sge sge = {};
+  int inflight, buflen, half_buflen;
+  void *src, *dst = NULL, *buf_read = NULL, *buf_write = NULL;
+  u16 crc_w_compress, crc_r_decompress;
+  u16 crc_w, crc_r;
+  int dlen, slen;
+  u64 roffset = 0x0;
+  void *dst_pagedone;
+  
+  struct page *page = NULL;
+
+  //page -[map]-> src -[cp]-> buf_write -[写读]-> buf_read -[dcp]-> dst <-[map]- page
+  //crc_w --> crc_w_compress --> crc_r --> crc_r_decompress
+
+  buflen = 4096;
+  half_buflen = buflen / 2;
+  
+  page = alloc_pages(GFP_KERNEL, get_order(buflen));
+
+
+  if (!page) {
+    printk(KERN_ERR "Failed to allocate %d bytes of memory\n", buflen);
+    goto out;
+  }
+  
+  // src -[cp]-> buf_write --> buf_read -[dcp]-> dst
+  pr_info("*********** begin pingpong compress page test *********");
+
+  // src = kmalloc(2 * buflen, GFP_KERNEL);
+  src = kmap_atomic(page);//映射page到Kernel va作为compress的源地址
+  dst = kmalloc(2 * buflen, GFP_KERNEL);//解压缩目的地址
+  buf_write = kmalloc(2 * buflen, GFP_KERNEL);//压缩目的地址 + RDMA写的buf
+  buf_read = kmalloc(2 * buflen, GFP_KERNEL);//RDMA读buf + 解压缩源地址
+  
+  //设置数据一半相同数据 一半随机数
+  memset(src, 7, half_buflen);
+  get_random_bytes(src + half_buflen, half_buflen); //设置随机数 会有问题 大部分 都不能压缩 4096 --> 4116
+
+
+  crc_w = crc16(0x0000, src, buflen);
+  compress(src, buflen, buf_write, &dlen);// buflen --> dlen
+  crc_w_compress = crc16(0x0000, buf_write, dlen);
+
+
+  kunmap_atomic(src);
+  // pr_info("random num:");
+  // p = (char *)src;
+  // for(i = 0; i < buflen; i++){
+  //   printk("%02X ", p[i]);
+  // }
+  // printk("\n");
+  pr_info("compress len: %d --> %d crc: %hx --> %hx", buflen, dlen, crc_w, crc_w_compress);
+
+  // q_write = sswap_rdma_get_queue(smp_processor_id(), QP_WRITE_SYNC);
+  // q_read = sswap_rdma_get_queue(smp_processor_id(), QP_READ_SYNC);
+  if(dlen > 4096){//没有压缩 就不写
+    goto out;
+  }
+
+  q_write = &(gctrl->queues[2]);//直接用第1个和第2个queue
+  q_read = &(gctrl->queues[3]);
+
+
+  //******** 写 **************
+  dev = q_write->ctrl->rdev->dev;//dev应该可以共享
+
+  while ((inflight = atomic_read(&q_write->pending)) >= QP_MAX_SEND_WR - 8) {
+    BUG_ON(inflight > QP_MAX_SEND_WR);
+    poll_target(q_write, 2048);
+    pr_info_ratelimited("back pressure writes");
+  }
+
+  ret = get_req_for_buf(&req_write, dev, buf_write, dlen, DMA_TO_DEVICE);//在kmem cache中分配rdma_req对象空间 
+  if (unlikely(ret))
+    return ret;
+  req_write->len = dlen;
+  req_write->cqe.done = sswap_rdma_write_buf_done;
+  ret = sswap_rdma_post_rdma(q_write, req_write, &sge, roffset, IB_WR_RDMA_WRITE);
+
+  drain_queue(q_write);//处理完所有的write done请求 ib_process_cq_direct(q->cq, 16);
+
+  sswap_rdma_wait_completion(q_write->cq, req_write);//ib_process_cq_direct(cq, 1);
+
+  //******** 读 **************
+  dev = q_read->ctrl->rdev->dev;//dev应该可以共享
+  while ((inflight = atomic_read(&q_read->pending)) >= QP_MAX_SEND_WR) {
+    BUG_ON(inflight > QP_MAX_SEND_WR); /* only valid case is == */
+    poll_target(q_read, 8);
+    pr_info_ratelimited("back pressure happened on reads");
+  }
+
+  ret = get_req_for_buf(&req_read, dev, buf_read, dlen, DMA_FROM_DEVICE);
+  if (unlikely(ret))
+    return ret;
+  req_read->len = dlen;//+++ 压缩后长度
+  req_read->src = buf_read;//+++ 用于done中解压缩的源地址
+  req_read->req_type = PINGPONG_COMPRESS_PAGE;//+++
+  req_read->page = page;//+++ 用于done中解压缩 作为dst
+  req_read->cqe.done = sswap_rdma_read_buf_done;
+  ret = sswap_rdma_post_rdma(q_read, req_read, &sge, roffset, IB_WR_RDMA_READ);
+  
+  drain_queue(q_read);
+
+  sswap_rdma_wait_completion(q_read->cq, req_read);//等待read_done 完成
+
+  //******** 验证 **************
+  //这里验证done decompress处理是否正确
+  // pr_info("************************");
+  dst_pagedone = kmap_atomic(page);//检查done返回的page中数据是否正确,是否和初始值相同
+
+
+  crc_r = crc16(0x0000, buf_read, dlen);
+  //buflen -> dlen -> slen
+  decompress(buf_read, dlen, dst, &slen);
+
+  crc_r_decompress = crc16(0x0000, dst, slen);
+
+  // pr_info("crc: %hx", crc_read);
+  pr_info("[done back] decompress len: %d --> %d crc: %hx --> %hx", dlen, slen, crc_r, crc_r_decompress);
+  pr_info("[done page back] crc: %hx", crc16(0x0000, dst_pagedone, PAGE_SIZE));
+  // pr_info("decompress addr: %p, len: %d", buf_read, dlen);
+  kunmap_atomic(dst_pagedone);
+
+
+  // p = (char *)dst;
+  // for(i = 0; i < buflen; i++){
+  //   printk("%02X ", p[i]);
+  // }
+  // printk("\n");
+
+  
+
+out:
+  // kfree(src);
+  kfree(dst);
+  kfree(buf_write);
+  kfree(buf_read);
+  __free_pages(page, get_order(buflen));
+
+  return ret;
+
+
+}
+
+
+
 static int __init sswap_rdma_init_module(void)
 {
   int ret;
-
   pr_info("start: %s\n", __FUNCTION__);
   pr_info("* RDMA BACKEND *");
 
@@ -1289,6 +1464,7 @@ static int __init sswap_rdma_init_module(void)
   compress_test();
   pingpong_test(); 
   pingpong_test_compress();
+  pingpong_test_compress_page();
   pr_info("ping pong test done");
     
 

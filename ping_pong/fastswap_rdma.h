@@ -13,7 +13,9 @@
 
 enum req_type{
   PINGPONG,
-  PINGPONG_COMPRESS
+  PINGPONG_PAGE,
+  PINGPONG_COMPRESS,
+  PINGPONG_COMPRESS_PAGE
 };
 
 enum qp_type {
@@ -35,6 +37,8 @@ struct rdma_req {
   struct page *page;
   int len;//+++
   void *src;//+++
+  u64 roffset;//+++ rb tree的key
+  u16 crc;
   enum req_type req_type;//+++ 增加请求类型 用于不同的done处理
 };
 
