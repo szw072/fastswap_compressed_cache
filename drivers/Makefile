@@ -24,7 +24,7 @@ endif
 #
 obj-m  := fastswap.o
 # ifeq ($(BACKEND),RDMA) # make BACKEND=RDMA
-ifeq ($(BACKEND), 1) #默认RDMA #直接make
+ifeq ($(BACKEND), ) #默认RDMA #直接make
 	obj-m += fastswap_rdma.o
 	CFLAGS_fastswap.o=-DBACKEND=2
 else #指定任意参数使用DRAM
