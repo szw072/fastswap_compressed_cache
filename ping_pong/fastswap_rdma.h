@@ -20,6 +20,8 @@ enum req_type{
 };
 
 enum data_type{
+  INIT,
+  SAME,
   HALF_RANDOM,
   RANDOM
 };
@@ -41,10 +43,12 @@ struct rdma_req {
   struct ib_cqe cqe;
   u64 dma;
   struct page *page;
-  int len;//+++
+  size_t len;//+++
   void *src;//+++
   u64 roffset;//+++ rb tree的key
   u16 crc;
+  u16 crc_uncompress;
+  u16 crc_compress;
   enum req_type req_type;//+++ 增加请求类型 用于不同的done处理
 };
 

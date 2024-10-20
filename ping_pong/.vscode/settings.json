@@ -1,0 +1,28 @@
+{
+    "files.associations": {
+        "Makefile": "cpp",
+        "rdma_cm.h": "c",
+        "spinlock.h": "c",
+        "list.h": "c",
+        "pagemap.h": "c",
+        "fastswap_rdma.h": "c",
+        "cpumask.h": "c",
+        "slab.h": "c",
+        "string.h": "c",
+        "random.h": "c",
+        "kasan.h": "c",
+        "io.h": "c",
+        "cstdarg": "c",
+        "type_traits": "c",
+        "limits": "c",
+        "cstdint": "c",
+        "cmath": "c",
+        "__config": "c",
+        "crypto.h": "c",
+        "mm_types.h": "c",
+        "ib_verbs.h": "c",
+        "printk.h": "c",
+        "xz.h": "c",
+        "lzo.h": "c"
+    }
+}

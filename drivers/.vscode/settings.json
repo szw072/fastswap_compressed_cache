@@ -1,5 +1,6 @@
 {
     "files.associations": {
+        "Makefile": "cpp",
         "fastswap_rdma.h": "c",
         "module.h": "c",
         "inet.h": "c",
@@ -27,7 +28,10 @@
         "uaccess.h": "c",
         "smp.h": "c",
         "string.h": "c",
-        "__config": "c"
+        "__config": "c",
+        "sched.h": "c",
+        "fcntl.h": "c",
+        "*.bak": "c"
     },
     "C_Cpp.errorSquiggles": "enabled"
 }

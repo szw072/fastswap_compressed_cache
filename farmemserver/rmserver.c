@@ -78,7 +78,7 @@ int main(int argc, char **argv)
   port = ntohs(rdma_get_src_port(listener));
   printf("listening on port %d.\n", port);
 
-  for (unsigned int i = 0; i < NUM_QUEUES; ++i) {
+  for (unsigned int i = 0; i < NUM_QUEUES; ++i) {//为每个queue 处理连接请求on_event
     printf("waiting for queue connection: %d\n", i);
     struct queue *q = &gctrl->queues[i];
 
@@ -246,7 +246,7 @@ int on_connection(struct queue *q)
     struct ibv_send_wr wr = {};
     struct ibv_send_wr *bad_wr = NULL;
     struct ibv_sge sge = {};
-    struct memregion servermr = {};
+    struct memregion servermr = {};//发送mr信息 包含64bit baseaddr 和 32bit key
 
     printf("connected. sending memory region info.\n");
     printf("MR key=%u base vaddr=%p\n", ctrl->mr_buffer->rkey, ctrl->mr_buffer->addr);
