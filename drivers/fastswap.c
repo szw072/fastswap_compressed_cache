@@ -31,14 +31,12 @@ static int sswap_store(unsigned type, pgoff_t pageid,
         struct page *page)
 {
   u64 roffset = pageid << PAGE_SHIFT;
-  pr_info("[write] roffset: %llx", roffset);//在sswap_store中输出
+  // pr_info("[write] roffset: %llx", roffset);//在sswap_store中输出
   if (sswap_rdma_write(page, pageid << PAGE_SHIFT)) {
     pr_err("could not store page remotely\n");
     return -1;
   }
   
-
-
   return 0;
 }
 
