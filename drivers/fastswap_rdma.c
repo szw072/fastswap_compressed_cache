@@ -60,6 +60,10 @@ static struct zswap_tree *zswap_trees;//rb tree数组,只一个swap area,申请�
 
 // static atomic_t local_stored_pages = ATOMIC_INIT(0);//未压缩成功存到本地dram数量
 static atomic_t zswap_stored_pages = ATOMIC_INIT(0);//存到页面数量
+static atomic_t total_pages = ATOMIC_INIT(0);//存到页面数量
+static atomic_t cachehit_pages = ATOMIC_INIT(0);//存到页面数量
+
+
 
 /*********************************
 * lzo decompress functions
@@ -852,7 +856,7 @@ static inline int drain_queue(struct rdma_queue *q)
   return 1;
 }
 
-static inline int write_queue_add(struct rdma_queue *q, struct page *page,
+static inline int rdma_write_queue_add(struct rdma_queue *q, struct page *page,
 				  u64 roffset)
 {
   struct rdma_req *req;
@@ -970,10 +974,170 @@ int dram_read(struct rdma_queue *q, struct page *page, u64 roffset){
   return 0;
 }
 
-/* Codes related to prefetch buffer starts here*/
+/*********************************
+* trend functions 
+**********************************/
+
+struct swap_entry {
+	long delta;//offset对应的delta
+	unsigned long offset;
+};
+
+struct swap_trend {
+	atomic_t head;
+	atomic_t size;
+	atomic_t max_size;
+	struct swap_entry *history;
+};
+
+static struct swap_trend trend_history;
+
+int get_prev_index(int index){
+    return ((index > 0) ? (index-1) : (atomic_read(&trend_history.max_size) - 1));
+}
+
+void inc_head(void) {
+    int current_head = atomic_read(&trend_history.head);
+    int max_size = atomic_read(&trend_history.max_size);
+    atomic_set(&trend_history.head, (( current_head + 1 ) % max_size));
+}
+
+void inc_size(void) {
+    int current_size = atomic_read(&trend_history.size);
+    int max_size = atomic_read(&trend_history.max_size);
+    
+    if(current_size < max_size) 
+        atomic_inc(&trend_history.size);
+}
+
+// void init_stat(void) {
+//         swap_cache_info.add_total = 0;
+//         swap_cache_info.del_total = 0;
+//         swap_cache_info.find_success = 0;
+//         swap_cache_info.find_total = 0;
+
+//         atomic_set(&my_swapin_readahead_hits, 0);
+//         atomic_set(&swapin_readahead_entry, 0);
+//         atomic_set(&trend_found, 0);
+// }
+
+void init_swap_trend(int size) {
+	//设置trend表大小为32 init_swap_trend(32)
+	trend_history.history = (struct swap_entry *) kzalloc(size * sizeof(struct swap_entry), GFP_KERNEL);
+	atomic_set(&trend_history.head, 0);
+	atomic_set(&trend_history.size, 0);
+	atomic_set(&trend_history.max_size , size);
+	
+	// init_stat();
+	printk("swap_trend history initiated for size: %d, head at: %d, curresnt_size: %d\n", atomic_read(&trend_history.max_size), atomic_read(&trend_history.head), atomic_read(&trend_history.size));
+}
+EXPORT_SYMBOL(init_swap_trend);
+
+void log_swap_trend(unsigned long offset) {
+	
+	long offset_delta;
+	int prev_index;
+	struct swap_entry se;
+	if(atomic_read(&trend_history.size)) {
+		prev_index = get_prev_index(atomic_read(&trend_history.head));
+		offset_delta = offset - trend_history.history[prev_index].offset;
+		
+		//printk("prev_index:%ld, offset_delta:%ld\n", prev_index, offset_delta);
+		
+		se.delta = offset_delta;
+		se.offset = offset;
+	}
+	else {//第一个entry没有prev
+	    se.delta = 0;
+	    se.offset = offset;
+	}
+	//循环链表 最大为 trend_history.max_size
+	trend_history.history[atomic_read(&trend_history.head)] = se;
+	inc_head();
+	inc_size();
+}
+
+int find_trend_in_region(int size, long *major_delta, int *major_count) {
+    int maj_index = get_prev_index(atomic_read(&trend_history.head)), count, i, j;
+    long candidate;
+    
+    for (i = get_prev_index(maj_index), j = 1, count = 1; j < size; i = get_prev_index(i), j++) {
+        if (trend_history.history[maj_index].delta == trend_history.history[i].delta)
+            count++;
+        else
+            count--;
+        if (count == 0) {
+            maj_index = i;
+            count = 1;
+        }
+    }
+    
+    candidate = trend_history.history[maj_index].delta;
+    for (i = get_prev_index(atomic_read(&trend_history.head)), j = 0, count = 0; j < size; i = get_prev_index(i), j++) {
+        if(trend_history.history[i].delta == candidate)
+            count++;
+    }
+    
+    //printk("majority index: %d, candidate: %ld, count:%d\n", maj_index, candidate, count);
+    *major_delta = candidate;
+    *major_count = count;
+    return count > (size/2);//计数是否大于一半
+}
+
+int find_trend (int *depth, long *major_delta, int *major_count) {
+    int has_trend = 0, size = (int) atomic_read(&trend_history.max_size)/4, max_size;
+	max_size = size * 4;
+	
+	while(has_trend == 0 && size <= max_size) {
+		//1/4 1/2 1
+		has_trend = find_trend_in_region(size, major_delta, major_count);
+		//printk( "at size: %d, trend found? %s\n", size, (has_trend == 0) ? "false" : "true" );
+		size *= 2;
+	}
+	*depth = size;
+	return has_trend;
+}
+
+// void show_swap_cache_info(void)
+// {
+// 	printk("%lu pages in swap cache\n", total_swapcache_pages());
+// 	printk("Swap cache stats: add %lu, delete %lu, find %lu/%lu\n",
+// 		swap_cache_info.add_total, swap_cache_info.del_total,
+// 		swap_cache_info.find_success, swap_cache_info.find_total);
+// 	printk("Free swap  = %ldkB\n",
+// 		get_nr_swap_pages() << (PAGE_SHIFT - 10));
+// 	printk("Total swap = %lukB\n", total_swap_pages << (PAGE_SHIFT - 10));
+// }
+
+// void swap_info_log(void){
+// 	show_swap_cache_info();
+// 	printk("\n\nmy_swapin_readahead_hits: %d, trend_found: %d, swapin_readahead_entry: %d\n", atomic_read(&my_swapin_readahead_hits), atomic_read(&trend_found), atomic_read(&swapin_readahead_entry));
+// }
+// EXPORT_SYMBOL(swap_info_log);
+
+
+/*********************************
+* prefetch buffer funcions
+**********************************/
+
 // 32MB
-unsigned long buffer_size = 8000;//最大size
+// unsigned long buffer_size = 8000;//32MB
+// unsigned long buffer_size = 50000;//200MB
+unsigned long buffer_size = 100000;//400MB
 unsigned long is_prefetch_buffer_active = 0;
+
+struct pref_buffer {
+	atomic_t head;
+	atomic_t tail;
+	atomic_t size;//当前buffer的大小
+	// swp_entry_t *offset_list;
+	// struct page **page_data;
+  struct zswap_entry **page_list;//缓存的page
+	spinlock_t buffer_lock;
+};
+
+static struct pref_buffer prefetch_buffer;
+
 
 void activate_prefetch_buffer(unsigned long val){
     is_prefetch_buffer_active = val;
@@ -984,21 +1148,8 @@ unsigned long get_prefetch_buffer_status(void) {
     return is_prefetch_buffer_active;
 }
 
-EXPORT_SYMBOL(activate_prefetch_buffer);
-EXPORT_SYMBOL(get_prefetch_buffer_status);
-
-struct pref_buffer {
-	atomic_t head;
-	atomic_t tail;
-	atomic_t size;//当前buffer的大小
-	// swp_entry_t *offset_list;
-	// struct page **page_data;
-  struct zswap_entry *page_list;//缓存的page
-	spinlock_t buffer_lock;
-};
-
-static struct pref_buffer prefetch_buffer;
-
+// EXPORT_SYMBOL(activate_prefetch_buffer);
+// EXPORT_SYMBOL(get_prefetch_buffer_status);
 
 static int get_buffer_head(void){
 	return atomic_read(&prefetch_buffer.head);
@@ -1011,17 +1162,17 @@ static int get_buffer_tail(void){
 static int get_buffer_size(void){
     return atomic_read(&prefetch_buffer.size);
 }
-
+// head元素出栈
 static void inc_buffer_head(void){
 	atomic_set(&prefetch_buffer.head, (atomic_read(&prefetch_buffer.head) + 1) % buffer_size);
-	atomic_dec(&prefetch_buffer.size);
+	// atomic_dec(&prefetch_buffer.size);
 	return;
 }
 
-//环形缓冲区
+// 在tail入栈 环形缓冲区
 static void inc_buffer_tail(void){
 	atomic_set(&prefetch_buffer.tail, (atomic_read(&prefetch_buffer.tail) + 1) % buffer_size);
-	atomic_inc(&prefetch_buffer.size);
+	// atomic_inc(&prefetch_buffer.size);
     	return;
 }
 
@@ -1038,14 +1189,15 @@ static int is_buffer_full(void){
 	return (buffer_size <= atomic_read(&prefetch_buffer.size));
 }
 
-//这里不是LRU缓存 简单的双端队列缓存
+
+
+
+//这里不是LRU缓存 简单的循环队列缓存
 void add_page_to_buffer(struct zswap_entry* entry){
 	int tail, head, error=0;
-  struct zswap_entry page_entry;
+  struct zswap_entry* page_entry;
 
 	spin_lock_irq(&prefetch_buffer.buffer_lock);
-	inc_buffer_tail();
-	tail = get_buffer_tail();
 	//buffer满了 尝试释放 head_page 
 	while(is_buffer_full() && error == 0){
 //		printk("%s: buffer is full for entry: %ld, head at: %d, tail at: %d\n", __func__, entry.val, get_buffer_head(), get_buffer_tail());
@@ -1053,18 +1205,62 @@ void add_page_to_buffer(struct zswap_entry* entry){
     
     //删除缓存 entry字段设成false
     page_entry = prefetch_buffer.page_list[head];
-    page_entry.cached = false;
+    page_entry->cached = false;
     // pr_info("** delete from page list %lx", entry->offset);
 		inc_buffer_head();
+    dec_buffer_size();
 	}
 	//尾部添加page
 	// prefetch_buffer.offset_list[tail] = entry;
 	// prefetch_buffer.page_data[tail] = page;
-  prefetch_buffer.page_list = entry;
+	tail = get_buffer_tail();
+  entry->cached = true;
+  prefetch_buffer.page_list[tail] = entry;
+	inc_buffer_tail();
 	inc_buffer_size();//增加buffer大小
 	spin_unlock_irq(&prefetch_buffer.buffer_lock);
+
+  
 }
-EXPORT_SYMBOL(add_page_to_buffer);
+// EXPORT_SYMBOL(add_page_to_buffer);
+
+void read_page_readahead(u64 offset){
+  struct zswap_tree *tree = zswap_trees;//每个swap area对应一个rb树 这里只使用一个
+  struct zswap_entry *entry;
+
+  int has_trend = 0, depth, major_count;
+  long major_delta;
+  u64 startoffset = offset;
+
+  //******** 查rb tree得dlen **************
+	spin_lock(&tree->lock);//lock 防止数据读写冲突
+	entry = zswap_entry_find_get(&tree->rbroot, offset);//1.根据roffset在rb树上查找到entry 包含len 2.refcount++
+  if (!entry) {
+		/* entry was written back */
+		spin_unlock(&tree->lock);
+    pr_info("rb treee not found");
+    BUG();
+	}
+	spin_unlock(&tree->lock);//unlock
+  
+  //******** 当前读 **************
+  add_page_to_buffer(entry);
+  
+  //******** prefetch **************
+  has_trend = find_trend(&depth, &major_delta, &major_count);
+  if(has_trend){
+    for(offset = startoffset + 1; offset < startoffset + depth; offset++){
+      spin_lock(&tree->lock);//lock 防止数据读写冲突
+      entry = zswap_entry_find_get(&tree->rbroot, offset);//1.根据roffset在rb树上查找到entry 包含len 2.refcount++
+      if (!entry) {
+        break;;
+      }
+      spin_unlock(&tree->lock);//unlock
+      //******** prefetch **************
+      add_page_to_buffer(entry);
+    }
+  }
+}
 
 void prefetch_buffer_init(unsigned long _size){	
 	printk("%s: initiating prefetch buffer with size %ld!\n",__func__, _size);
@@ -1077,7 +1273,7 @@ void prefetch_buffer_init(unsigned long _size){
 	//kzalloc分配内存空间
 	// prefetch_buffer.offset_list = (swp_entry_t *) kzalloc(buffer_size * sizeof(swp_entry_t), GFP_KERNEL);
 	// prefetch_buffer.page_data = (struct page **) kzalloc(buffer_size * sizeof(struct page *), GFP_KERNEL);
-  prefetch_buffer.page_list = (struct zswap_entry *) kzalloc(buffer_size * sizeof(struct zswap_entry), GFP_KERNEL);
+  prefetch_buffer.page_list = (struct zswap_entry **) kzalloc(buffer_size * sizeof(struct zswap_entry *), GFP_KERNEL);
 	atomic_set(&prefetch_buffer.head, 0);
 	atomic_set(&prefetch_buffer.tail, 0);
 	atomic_set(&prefetch_buffer.size, 0);
@@ -1085,17 +1281,21 @@ void prefetch_buffer_init(unsigned long _size){
 	printk("%s: prefetch buffer initiated with size: %d, head at: %d, tail at: %d\n", __func__, get_buffer_size(), get_buffer_head(), get_buffer_tail());
 	return;
 }
-EXPORT_SYMBOL(prefetch_buffer_init);
+// EXPORT_SYMBOL(prefetch_buffer_init);
 
-int rdma_read(struct rdma_req **req, struct rdma_queue *q, struct page *page, u64 roffset, struct zswap_entry *entry){
-  // struct rdma_req *req;
+int rdma_read(struct rdma_queue *q, struct page *page, u64 roffset,
+              struct zswap_entry *entry){
+  struct rdma_req *req;
   struct ib_device *dev = q->ctrl->rdev->dev;
   struct ib_sge sge = {};
   int ret, inflight;
   void *buf_read;
-  int rlen = entry->length;//读一个page
+  // void *dst;
+  // int decompress_ret, slen;
+  // u16 crc_r, crc_r_decompress;
+  // void *decompress_buf;
 
-
+  // pr_info("[begin_read] roffset: %llx", roffset);//读输出roffset
   /* back pressure in-flight reads, can't send more than
    * QP_MAX_SEND_WR at a time */
   while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR) {
@@ -1104,37 +1304,36 @@ int rdma_read(struct rdma_req **req, struct rdma_queue *q, struct page *page, u6
     pr_info_ratelimited("back pressure happened on reads");
   }
 
-  // pr_info("[begin_read] roffset: %llx", roffset);//读输出roffset
-
-  //******** RDMA读 **************
-  buf_read = kmalloc(rlen, GFP_KERNEL);//作为read buf
-  ret = get_req_for_buf(req, dev, buf_read, rlen, DMA_FROM_DEVICE);
+  buf_read = kmalloc(PAGE_SIZE, GFP_KERNEL);//作为read buf
+  if(buf_read == NULL){
+    pr_err("kmalloc wrong!!!");
+    BUG();
+  }
+  ret = get_req_for_buf(&req, dev, buf_read, entry->length, DMA_FROM_DEVICE);
 
   // ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
-
   if (unlikely(ret))
     return ret;
-  (*req)->roffset = roffset;//+++++ 用于done中pr_info
-  (*req)->page = page;//+++ 用于done中释放 SetPageUptodate()和unlock_page()
-  (*req)->src = buf_read;//+++ 用于释放
-  (*req)->len = rlen;//+++ post请求设置sge->length
-  (*req)->cqe.done = sswap_rdma_read_done;
-  (*req)->crc_compress = entry->crc_compress;
-  (*req)->crc_uncompress = entry->crc_uncompress;
-  ret = sswap_rdma_post_rdma(q, (*req), &sge, roffset, IB_WR_RDMA_READ);
+  req->len = entry->length;//+++ 用于unmap
+  req->roffset = roffset;//+++++
+  req->page = page;//+++
+  req->src = buf_read;//+++
+  req->crc_compress = entry->crc_compress;//+++ 用于解压缩校验
+  req->crc_uncompress = entry->crc_uncompress;//+++ 用于解压缩校验
+  req->cqe.done = sswap_rdma_read_done;
+  ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_READ);
+  
+  // sswap_rdma_wait_completion(q->cq, req);//等待read done完成 这里解压缩移到read_done中 不需要同步
 
   return ret;
 }
 
-
-static inline int _begin_read(struct rdma_queue *q, struct page *page,
+static inline int begin_read(struct rdma_queue *q, struct page *page,
 			     u64 roffset)
 {
-  struct rdma_req *req;
   int ret;
   struct zswap_tree *tree = zswap_trees;//每个swap area对应一个rb树 这里只使用一个
   struct zswap_entry *entry;
-
 
   //******** 查rb tree得dlen **************
 	spin_lock(&tree->lock);//lock 防止数据读写冲突
@@ -1149,27 +1348,33 @@ static inline int _begin_read(struct rdma_queue *q, struct page *page,
 	spin_unlock(&tree->lock);//unlock
   // pr_info("found rbtree entry roffest: %lx, length: %d --> %zu crc: %hx --> %hx", entry->offset, 4096, entry->length, entry->crc_uncompress, entry->crc_compress);
 
-  //******** 添加到缓存 **************
-  add_page_to_buffer(entry);
 
-  entry->cached = false;
+  // entry->cached = true;
   if(entry->cached){//缓存在local
     //******** dram读 **************
     // pr_info("cache hit %lx", entry->offset);
+    atomic_inc(&cachehit_pages);
     ret = dram_read(q, page, roffset);//rdma读请求后 接dram读
   } else {
     //******** rdma读 **************
-    ret = rdma_read(&req, q, page, roffset, entry);
+    ret = rdma_read(q, page, roffset, entry);
     //******** 同步操作 等待read done完成 再释放page **************
     // sswap_rdma_wait_completion(q->cq, req);//等待read done完成
     // kmem_cache_free(req_cache, req);//read_done中 移到在外面释放 wait_completion需要使用
   }
+  //******** 记录trend **************
+  log_swap_trend(roffset);
+  
+  //******** 添加到缓存 + prefetch **************
+  read_page_readahead(roffset);
 
+  atomic_inc(&total_pages);
   return ret;
 }
 
-static inline int begin_read(struct rdma_queue *q, struct page *page,
-			     u64 roffset)
+
+
+static inline int _begin_read(struct rdma_queue *q, struct page *page, u64 roffset)
 {
   struct rdma_req *req;
   struct ib_device *dev = q->ctrl->rdev->dev;
@@ -1213,7 +1418,7 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
   add_page_to_buffer(entry);
   
   //******** 检查是否命中缓存 更新缓存 **************
-  entry->cached = false;
+  //entry->cached = true;
   if(entry->cached){//缓存在local
     pr_info("cache hit %lx", entry->offset);
     //添加缓存
@@ -1267,7 +1472,7 @@ int sswap_rdma_write(struct page *page, u64 roffset)
 
   q = sswap_rdma_get_queue(smp_processor_id(), QP_WRITE_SYNC);
   //******** rdma写 **************
-  ret = write_queue_add(q, page, roffset);
+  ret = rdma_write_queue_add(q, page, roffset);
   BUG_ON(ret);
   drain_queue(q);
 
@@ -1415,10 +1620,15 @@ static int __init sswap_rdma_init_module(void)
 
   init_rbtree();
 
+  //******** 初始化缓存 **************
+  prefetch_buffer_init(buffer_size);
+
   //******** 申请dram内存 **************
   drambuf = vzalloc(REMOTE_BUF_SIZE);//30GB
 	pr_info("vzalloc'ed %lu bytes for dram backend\n", REMOTE_BUF_SIZE);
 
+//******** 初始化trend history **************
+  init_swap_trend(32);
 
   pr_info("ctrl is ready for reqs\n");
   return 0;
@@ -1437,6 +1647,8 @@ static void __exit sswap_rdma_cleanup_module(void)
   //drambuf 和 缓存list
   vfree(drambuf);
   kfree(prefetch_buffer.page_list);
+  pr_info("[summary] total: %d  cache hit: %d", atomic_read(&total_pages),  atomic_read(&cachehit_pages));
+  pr_info("fsswap_rdma_cleanup_module");
 }
 
 module_init(sswap_rdma_init_module);
