@@ -8,3 +8,7 @@
 *.pyc
 modules.order
 Module.symvers
+ping_pong/.*
+.vscode/
+*.json
+*.bak

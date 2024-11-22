@@ -14,7 +14,7 @@
 #include <linux/percpu-defs.h>
 
 #include <linux/lzo.h>
-
+#include <linux/delay.h>
 
 
 static struct sswap_rdma_ctrl *gctrl;
@@ -689,6 +689,24 @@ static void __exit sswap_rdma_cleanup_module(void)
   zswap_frontswap_invalidate_area();
 }
 
+static void sswap_rdma_write_done_syn(struct ib_cq *cq, struct ib_wc *wc)
+{
+  struct rdma_req *req =
+    container_of(wc->wr_cqe, struct rdma_req, cqe);
+  struct rdma_queue *q = cq->cq_context;
+  struct ib_device *ibdev = q->ctrl->rdev->dev;
+
+  if (unlikely(wc->status != IB_WC_SUCCESS)) {
+    pr_err("sswap_rdma_write_done status is not success, it is=%d\n", wc->status);
+    //q->write_error = wc->status;
+  }
+  ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_TO_DEVICE);
+
+  complete(&req->done);//++++ 保证写完成再读
+
+  atomic_dec(&q->pending);
+}
+
 static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
 {
   struct rdma_req *req =
@@ -700,7 +718,8 @@ static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
     pr_err("sswap_rdma_write_done status is not success, it is=%d\n", wc->status);
     //q->write_error = wc->status;
   }
-  ib_dma_unmap_page(ibdev, req->dma, req->len, DMA_TO_DEVICE);
+  ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_TO_DEVICE);
+
 
   atomic_dec(&q->pending);
   kmem_cache_free(req_cache, req);
@@ -732,7 +751,7 @@ static void sswap_rdma_write_buf_done(struct ib_cq *cq, struct ib_wc *wc)
   atomic_dec(&q->pending);
   kmem_cache_free(req_cache, req);
 }
-//删除释放req
+
 static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
 {
   struct rdma_req *req =
@@ -740,34 +759,37 @@ static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
   struct rdma_queue *q = cq->cq_context;
   struct ib_device *ibdev = q->ctrl->rdev->dev;
 
+  if (unlikely(wc->status != IB_WC_SUCCESS))
+    pr_err("sswap_rdma_read_done status is not success, it is=%d\n", wc->status);
 
-  pr_info("--> jump to read_done");
+  ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_FROM_DEVICE);
 
-  // compress_test_v3();
-  
+  SetPageUptodate(req->page);
+  unlock_page(req->page);
+  complete(&req->done);
+  atomic_dec(&q->pending);
+  kmem_cache_free(req_cache, req);
+}
+
+//删除释放req
+static void sswap_rdma_read_done_syn(struct ib_cq *cq, struct ib_wc *wc)
+{
+  struct rdma_req *req =
+    container_of(wc->wr_cqe, struct rdma_req, cqe);
+  struct rdma_queue *q = cq->cq_context;
+  struct ib_device *ibdev = q->ctrl->rdev->dev;
 
   if (unlikely(wc->status != IB_WC_SUCCESS))
     pr_err("sswap_rdma_read_done status is not success, it is=%d\n", wc->status);
 
-  ib_dma_unmap_single(ibdev, req->dma, req->len, DMA_FROM_DEVICE);
+  ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_FROM_DEVICE);
 
-  // decompress_buf_read_alloc_free(req);//++++
-  // decompress_buf_read_tfm(req);//+++++
-  // decompress_buf_read_tfm_percpu(req);//+++++
-
-  
-
-
-  // SetPageUptodate(req->page);
-  // unlock_page(req->page);
-  complete(&req->done);//没有wait函数
+  SetPageUptodate(req->page);
+  unlock_page(req->page);
+  complete(&req->done);
   atomic_dec(&q->pending);
   // kmem_cache_free(req_cache, req);
-
-  pr_info("<-- jump back");
 }
-
-
 static void sswap_rdma_read_done_decompress(struct ib_cq *cq, struct ib_wc *wc)
 {
   struct rdma_req *req =
@@ -897,8 +919,6 @@ static void sswap_rdma_read_buf_done(struct ib_cq *cq, struct ib_wc *wc)
   char alg[] = "lzo";
 
 
-
-
   if (unlikely(wc->status != IB_WC_SUCCESS))
     pr_err("sswap_rdma_read_done status is not success, it is=%d\n", wc->status);
 
@@ -1014,7 +1034,7 @@ inline static int sswap_rdma_post_rdma(struct rdma_queue *q, struct rdma_req *qe
 
   sge->addr = qe->dma;
   // sge->length = PAGE_SIZE;
-  sge->length = qe->len;//按照创建rdma_req设置sge长度
+  sge->length = qe->len;//++++ 按照创建rdma_req设置sge长度
   sge->lkey = q->ctrl->rdev->pd->local_dma_lkey;
 
   /* TODO: add a chain of WR, we already have a list so should be easy
@@ -1184,32 +1204,6 @@ static inline int drain_queue(struct rdma_queue *q)
   return 1;
 }
 
-// static inline int write_queue_add(struct rdma_queue *q, struct page *page,
-// 				  u64 roffset)
-// {
-//   struct rdma_req *req;
-//   struct ib_device *dev = q->ctrl->rdev->dev;
-//   struct ib_sge sge = {};
-//   int ret, inflight;
-
-//   while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR - 8) {
-//     BUG_ON(inflight > QP_MAX_SEND_WR);
-//     poll_target(q, 2048);
-//     pr_info_ratelimited("back pressure writes");
-//   }
-
-//   ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
-//   if (unlikely(ret))
-//     return ret;
-
-//   req->cqe.done = sswap_rdma_write_done;
-//   ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_WRITE);
-
-//   return ret;
-// }
-
-
-//压缩版
 static inline int write_queue_add(struct rdma_queue *q, struct page *page,
 				  u64 roffset)
 {
@@ -1217,16 +1211,6 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
   struct ib_device *dev = q->ctrl->rdev->dev;
   struct ib_sge sge = {};
   int ret, inflight;
-  void *src;
-  int page_len = PAGE_SIZE, wlen;
-  void *buf_write, *compress_buf = NULL, *uncompress_buf = NULL;
-  u16 crc_uncompress, crc_compress;
-
-  struct zswap_tree *tree = zswap_trees;//每个swap area对应一个rb树 这里只使用一个
-  struct zswap_entry *entry = NULL, *dupentry;
-
-  // char *p;
-  // int i;
 
   while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR - 8) {
     BUG_ON(inflight > QP_MAX_SEND_WR);
@@ -1234,87 +1218,150 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
     pr_info_ratelimited("back pressure writes");
   }
 
-  src = kmap_atomic(page);
-  uncompress_buf = kmalloc(page_len, GFP_KERNEL);//作未压缩page内容的rdma写buf
-  if(uncompress_buf == NULL){
-    pr_info("kmalloc wrong!!!");
-    BUG();
-  }
-  compress_buf = kmalloc(2 *  page_len, GFP_KERNEL);//压缩目的地址
-  if(compress_buf == NULL){
-    pr_info("kmalloc wrong!!!");
-    BUG();
-  }
-  crc_uncompress = crc16(0x0000, src, page_len);
-  compress(src, page_len, compress_buf, &wlen);
-  crc_compress = crc16(0x0000, compress_buf, wlen);
-
-
-
-  if(wlen >= 4096){//不能压缩 使用原page
-    kfree(compress_buf);
-    memcpy(uncompress_buf, src, PAGE_SIZE);
-    buf_write = uncompress_buf;
-    wlen = page_len;
-  }
-  else{//能压缩 使用压缩后数据
-    kfree(uncompress_buf);
-    buf_write = compress_buf;
-  }
-  kunmap_atomic(src);
-
-  pr_info("[write] cpuid: %d offset: %llx len: %d --> %d crc: %hx --> %hx", smp_processor_id(), roffset, page_len, wlen, crc_uncompress, crc_compress);
-
-  ret = get_req_for_buf(&req, dev, buf_write, wlen, DMA_TO_DEVICE);//设置req中地址dma 长度len
-
-  // p = (char *)buf_write;
-  // for(i = 0; i < wlen; i++){
-  //   printk("%02X ", p[i]);
-  // }
-
-
-
+  ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
   if (unlikely(ret))
     return ret;
-  req->len = wlen;//+++ 用于post请求设置sge
-  req->src = buf_write;
-  req->crc_compress = crc_compress;
-  req->crc_uncompress = crc_uncompress;
-  req->roffset = roffset;
-  req->cqe.done = sswap_rdma_write_done;//添加同步操作
+
+  req->len = PAGE_SIZE;
+  req->cqe.done = sswap_rdma_write_done;
   ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_WRITE);
 
-  // sswap_rdma_wait_completion(q->cq, req);//+++++++同步 等待写完成
-
-  //TODO 这里可能有问题 rb tree插入在post请求之后执行 可能存在写未完成 rb tree已经插入 但是应该问题不大 因为不在done中unlock page应该不会发起读请求
-  //******** 插入rb tree **************
-  entry = kmalloc(sizeof(struct zswap_entry), GFP_KERNEL); //申请插入rbtree 的swap entry
-  if(entry == NULL){
-    pr_info("kmalloc wrong!!!");
-    BUG();
-  }
-  RB_CLEAR_NODE(&entry->rbnode);
-  entry->offset = req->roffset;
-  entry->length = req->len;
-  entry->crc_compress = req->crc_compress;//+++ 用于读校验
-  entry->crc_uncompress = req->crc_uncompress;//+++ 用于读校验
-
-  spin_lock(&tree->lock);
-	do {
-		ret = zswap_rb_insert(&tree->rbroot, entry, &dupentry);
-		if (ret == -EEXIST) {//重复的entry 应该删除重复的entry(dupentry)
-      pr_info("[Write_duplicate] offset: %lx", entry->offset);
-			// zswap_duplicate_entry++;
-			/* remove from rbtree */
-			zswap_rb_erase(&tree->rbroot, dupentry);
-      kfree(dupentry);//释放entry
-			// zswap_entry_put(tree, dupentry)
-		}
-	} while (ret == -EEXIST);
-  spin_unlock(&tree->lock);
-  
   return ret;
 }
+
+static inline struct rdma_req * write_queue_add_syn(struct rdma_queue *q, struct page *page,
+				  u64 roffset)
+{
+  struct rdma_req *req;
+  struct ib_device *dev = q->ctrl->rdev->dev;
+  struct ib_sge sge = {};
+  int ret, inflight;
+
+  while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR - 8) {
+    BUG_ON(inflight > QP_MAX_SEND_WR);
+    poll_target(q, 2048);
+    pr_info_ratelimited("back pressure writes");
+  }
+
+  ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
+  // if (unlikely(ret))
+  //   return ret;
+
+  req->cqe.done = sswap_rdma_write_done_syn;
+  req->len = PAGE_SIZE;
+  ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_WRITE);
+
+  return req;
+}
+
+
+
+// //压缩版
+// static inline int write_queue_add(struct rdma_queue *q, struct page *page,
+// 				  u64 roffset)
+// {
+//   struct rdma_req *req;
+//   struct ib_device *dev = q->ctrl->rdev->dev;
+//   struct ib_sge sge = {};
+//   int ret, inflight;
+//   void *src;
+//   int page_len = PAGE_SIZE, wlen;
+//   void *buf_write, *compress_buf = NULL, *uncompress_buf = NULL;
+//   u16 crc_uncompress, crc_compress;
+
+//   struct zswap_tree *tree = zswap_trees;//每个swap area对应一个rb树 这里只使用一个
+//   struct zswap_entry *entry = NULL, *dupentry;
+
+//   // char *p;
+//   // int i;
+
+//   while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR - 8) {
+//     BUG_ON(inflight > QP_MAX_SEND_WR);
+//     poll_target(q, 2048);
+//     pr_info_ratelimited("back pressure writes");
+//   }
+
+//   src = kmap_atomic(page);
+//   uncompress_buf = kmalloc(page_len, GFP_KERNEL);//作未压缩page内容的rdma写buf
+//   if(uncompress_buf == NULL){
+//     pr_info("kmalloc wrong!!!");
+//     BUG();
+//   }
+//   compress_buf = kmalloc(2 *  page_len, GFP_KERNEL);//压缩目的地址
+//   if(compress_buf == NULL){
+//     pr_info("kmalloc wrong!!!");
+//     BUG();
+//   }
+//   crc_uncompress = crc16(0x0000, src, page_len);
+//   compress(src, page_len, compress_buf, &wlen);
+//   crc_compress = crc16(0x0000, compress_buf, wlen);
+
+
+
+//   if(wlen >= 4096){//不能压缩 使用原page
+//     kfree(compress_buf);
+//     memcpy(uncompress_buf, src, PAGE_SIZE);
+//     buf_write = uncompress_buf;
+//     wlen = page_len;
+//   }
+//   else{//能压缩 使用压缩后数据
+//     kfree(uncompress_buf);
+//     buf_write = compress_buf;
+//   }
+//   kunmap_atomic(src);
+
+//   pr_info("[write] cpuid: %d offset: %llx len: %d --> %d crc: %hx --> %hx", smp_processor_id(), roffset, page_len, wlen, crc_uncompress, crc_compress);
+
+//   ret = get_req_for_buf(&req, dev, buf_write, wlen, DMA_TO_DEVICE);//设置req中地址dma 长度len
+
+//   // p = (char *)buf_write;
+//   // for(i = 0; i < wlen; i++){
+//   //   printk("%02X ", p[i]);
+//   // }
+
+
+
+//   if (unlikely(ret))
+//     return ret;
+//   req->len = wlen;//+++ 用于post请求设置sge
+//   req->src = buf_write;
+//   req->crc_compress = crc_compress;
+//   req->crc_uncompress = crc_uncompress;
+//   req->roffset = roffset;
+//   req->cqe.done = sswap_rdma_write_done;//添加同步操作
+//   ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_WRITE);
+
+//   // sswap_rdma_wait_completion(q->cq, req);//+++++++同步 等待写完成
+
+//   //TODO 这里可能有问题 rb tree插入在post请求之后执行 可能存在写未完成 rb tree已经插入 但是应该问题不大 因为不在done中unlock page应该不会发起读请求
+//   //******** 插入rb tree **************
+//   entry = kmalloc(sizeof(struct zswap_entry), GFP_KERNEL); //申请插入rbtree 的swap entry
+//   if(entry == NULL){
+//     pr_info("kmalloc wrong!!!");
+//     BUG();
+//   }
+//   RB_CLEAR_NODE(&entry->rbnode);
+//   entry->offset = req->roffset;
+//   entry->length = req->len;
+//   entry->crc_compress = req->crc_compress;//+++ 用于读校验
+//   entry->crc_uncompress = req->crc_uncompress;//+++ 用于读校验
+
+//   spin_lock(&tree->lock);
+// 	do {
+// 		ret = zswap_rb_insert(&tree->rbroot, entry, &dupentry);
+// 		if (ret == -EEXIST) {//重复的entry 应该删除重复的entry(dupentry)
+//       pr_info("[Write_duplicate] offset: %lx", entry->offset);
+// 			// zswap_duplicate_entry++;
+// 			/* remove from rbtree */
+// 			zswap_rb_erase(&tree->rbroot, dupentry);
+//       kfree(dupentry);//释放entry
+// 			// zswap_entry_put(tree, dupentry)
+// 		}
+// 	} while (ret == -EEXIST);
+//   spin_unlock(&tree->lock);
+  
+//   return ret;
+// }
 
 //lzo压缩
 static inline int write_queue_add_lzo(struct rdma_queue *q, struct page *page,
@@ -1429,33 +1476,6 @@ static inline int write_queue_add_lzo(struct rdma_queue *q, struct page *page,
   return ret;
 }
 
-// static inline int begin_read(struct rdma_queue *q, struct page *page,
-// 			     u64 roffset)
-// {
-//   struct rdma_req *req;
-//   struct ib_device *dev = q->ctrl->rdev->dev;
-//   struct ib_sge sge = {};
-//   int ret, inflight;
-
-//   /* back pressure in-flight reads, can't send more than
-//    * QP_MAX_SEND_WR at a time */
-//   while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR) {
-//     BUG_ON(inflight > QP_MAX_SEND_WR); /* only valid case is == */
-//     poll_target(q, 8);
-//     pr_info_ratelimited("back pressure happened on reads");
-//   }
-
-//   ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
-//   if (unlikely(ret))
-//     return ret;
-
-//   req->cqe.done = sswap_rdma_read_done;
-//   ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_READ);
-//   //这里没有wait等待req->done的函数 直接返回 在recv mr中有
-//   return ret;
-// }
-
-
 static inline int begin_read(struct rdma_queue *q, struct page *page,
 			     u64 roffset)
 {
@@ -1463,27 +1483,7 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
   struct ib_device *dev = q->ctrl->rdev->dev;
   struct ib_sge sge = {};
   int ret, inflight;
-  void *buf_read, *dst;
-  int decompress_ret, slen;
-  u16 crc_r, crc_r_decompress;
-  struct crypto_comp *tfm;
-  char alg[] = "lzo";
 
-  // struct page *page;
-
-  struct zswap_tree *tree = zswap_trees;//每个swap area对应一个rb树 这里只使用一个
-  struct zswap_entry *entry;
-
-
-
-  // char *p;
-  // int i;
-
-  // page = alloc_pages(GFP_KERNEL, get_order(PAGE_SIZE));
-  // compress_test_v3();
-
-
-  pr_info("[begin_read] roffset: %llx", roffset);//读输出roffset
   /* back pressure in-flight reads, can't send more than
    * QP_MAX_SEND_WR at a time */
   while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR) {
@@ -1492,102 +1492,174 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
     pr_info_ratelimited("back pressure happened on reads");
   }
 
-  //******** 查rb tree得dlen **************
-	spin_lock(&tree->lock);//lock 防止数据读写冲突
-	entry = zswap_entry_find_get(&tree->rbroot, roffset);//1.根据roffset在rb树上查找到entry 包含len 2.refcount++
-  if (!entry) {
-		/* entry was written back */
-		spin_unlock(&tree->lock);
-    pr_info("rb treee not found");
-    BUG();
-		return -1;
-	}
-	spin_unlock(&tree->lock);//unlock
-  pr_info("found rbtree entry roffest: %lx, length: %d --> %zu crc: %hx --> %hx", entry->offset, 4096, entry->length, entry->crc_uncompress, entry->crc_compress);
-
-  // src = (u8 *)kmap_atomic(page);
-  buf_read = kmalloc(PAGE_SIZE, GFP_KERNEL);//作为read buf
-  if(buf_read == NULL){
-    pr_info("kmalloc wrong!!!");
-    BUG();
-  }
-  ret = get_req_for_buf(&req, dev, buf_read, entry->length, DMA_FROM_DEVICE);
-
-  // ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
-
+  ret = get_req_for_page(&req, dev, page, DMA_FROM_DEVICE);
   if (unlikely(ret))
     return ret;
-  req->len = entry->length;//+++ 用于unmap
-  req->roffset = roffset;//+++++
-  req->page = page;//+++
-  req->src = buf_read;//+++
-  req->crc_compress = entry->crc_compress;//+++ 用于解压缩校验
-  req->crc_uncompress = entry->crc_uncompress;//+++ 用于解压缩校验
+
   req->cqe.done = sswap_rdma_read_done;
   ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_READ);
-
-  sswap_rdma_wait_completion(q->cq, req);//等待read done完成
-
-  //******** 解压缩 **************
-  // p = (char *)req->src;
-  // for(i = 0; i < req->len; i++){
-  //   printk("%02X ", p[i]);
-  // }
-  //******** compress 测试 **************
-
-  
-  dst = kmap_atomic(req->page);//
-  crc_r = crc16(0x0000 , req->src, req->len);//对读数据进行校验
-
-//******** v3 alloc free **************
-  pr_info("------ decompress alloc free --------");
-  
-  tfm = crypto_alloc_comp(alg,0,0);
-  decompress_ret = crypto_comp_decompress(tfm, req->src, req->len, dst, &slen); 
-  crypto_free_comp(tfm);     
-
-  crc_r_decompress = crc16(0x0000, dst, slen);
-
-  pr_info("[done back] decompress cpuid: %d len: %zu --> %d crc: %hx --> %hx ret: %d",smp_processor_id(), req->len, slen, crc_r, crc_r_decompress, decompress_ret);
-
- //******** v4 _tfm **************  未通过 len --> 0 ret: -22
-
-  pr_info("------ decompress _tfm --------");
-  tfm = _tfm;
-  decompress_ret = crypto_comp_decompress(_tfm, req->src, req->len, dst, &slen);      
-
-  crc_r_decompress = crc16(0x0000, dst, slen);
-
-  pr_info("[done back] decompress cpuid: %d len: %zu --> %d crc: %hx --> %hx ret: %d",smp_processor_id(), req->len, slen, crc_r, crc_r_decompress, decompress_ret);
-
-  // compress_test_v3();//++++++
-//******** v5 tfm_percpu ************** 未通过 len --> 0 ret: -22
-
-  pr_info("------ decompress tfm_percpu --------");
-  tfm = *get_cpu_ptr(tfm_percpu);
-  // tfm = *per_cpu_ptr(tfm_percpu, get_cpu());
-  decompress_ret = crypto_comp_decompress(tfm, req->src, req->len, dst, &slen);
-  // put_cpu();
-	put_cpu_ptr(tfm_percpu);
-  crc_r_decompress = crc16(0x0000, dst, slen);
-  
-  pr_info("[done back] decompress cpuid: %d len: %zu --> %d crc: %hx --> %hx ret: %d",smp_processor_id(), req->len, slen, crc_r, crc_r_decompress, decompress_ret);
-
-  decompress_buf_read_alloc_free(req);//++++
-  decompress_buf_read_tfm(req);//++++
-  decompress_buf_read_tfm_percpu(req);//+++++
-
-
-
-  kmem_cache_free(req_cache, req);//不能提前释放
-  kunmap_atomic(dst);
-  kfree(req->src);
-
-  // __free_pages(page, get_order(PAGE_SIZE));
-  // SetPageUptodate(req->page);
-  // unlock_page(req->page);
   return ret;
 }
+
+static inline struct rdma_req * begin_read_syn(struct rdma_queue *q, struct page *page,
+			     u64 roffset)
+{
+  struct rdma_req *req;
+  struct ib_device *dev = q->ctrl->rdev->dev;
+  struct ib_sge sge = {};
+  int ret, inflight;
+
+  /* back pressure in-flight reads, can't send more than
+   * QP_MAX_SEND_WR at a time */
+  while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR) {
+    BUG_ON(inflight > QP_MAX_SEND_WR); /* only valid case is == */
+    poll_target(q, 8);
+    pr_info_ratelimited("back pressure happened on reads");
+  }
+
+  ret = get_req_for_page(&req, dev, page, DMA_FROM_DEVICE);
+  // if (unlikely(ret))
+  //   return ret;
+
+  req->len = PAGE_SIZE;
+  req->cqe.done = sswap_rdma_read_done_syn;
+  ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_READ);
+  return req;
+}
+
+
+// static inline int begin_read(struct rdma_queue *q, struct page *page,
+// 			     u64 roffset)
+// {
+//   struct rdma_req *req;
+//   struct ib_device *dev = q->ctrl->rdev->dev;
+//   struct ib_sge sge = {};
+//   int ret, inflight;
+//   void *buf_read, *dst;
+//   int decompress_ret, slen;
+//   u16 crc_r, crc_r_decompress;
+//   struct crypto_comp *tfm;
+//   char alg[] = "lzo";
+
+//   // struct page *page;
+
+//   struct zswap_tree *tree = zswap_trees;//每个swap area对应一个rb树 这里只使用一个
+//   struct zswap_entry *entry;
+
+
+
+//   // char *p;
+//   // int i;
+
+//   // page = alloc_pages(GFP_KERNEL, get_order(PAGE_SIZE));
+//   // compress_test_v3();
+
+
+//   pr_info("[begin_read] roffset: %llx", roffset);//读输出roffset
+//   /* back pressure in-flight reads, can't send more than
+//    * QP_MAX_SEND_WR at a time */
+//   while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR) {
+//     BUG_ON(inflight > QP_MAX_SEND_WR); /* only valid case is == */
+//     poll_target(q, 8);
+//     pr_info_ratelimited("back pressure happened on reads");
+//   }
+
+//   //******** 查rb tree得dlen **************
+// 	spin_lock(&tree->lock);//lock 防止数据读写冲突
+// 	entry = zswap_entry_find_get(&tree->rbroot, roffset);//1.根据roffset在rb树上查找到entry 包含len 2.refcount++
+//   if (!entry) {
+// 		/* entry was written back */
+// 		spin_unlock(&tree->lock);
+//     pr_info("rb treee not found");
+//     BUG();
+// 		return -1;
+// 	}
+// 	spin_unlock(&tree->lock);//unlock
+//   pr_info("found rbtree entry roffest: %lx, length: %d --> %zu crc: %hx --> %hx", entry->offset, 4096, entry->length, entry->crc_uncompress, entry->crc_compress);
+
+//   // src = (u8 *)kmap_atomic(page);
+//   buf_read = kmalloc(PAGE_SIZE, GFP_KERNEL);//作为read buf
+//   if(buf_read == NULL){
+//     pr_info("kmalloc wrong!!!");
+//     BUG();
+//   }
+//   ret = get_req_for_buf(&req, dev, buf_read, entry->length, DMA_FROM_DEVICE);
+
+//   // ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
+
+//   if (unlikely(ret))
+//     return ret;
+//   req->len = entry->length;//+++ 用于unmap
+//   req->roffset = roffset;//+++++
+//   req->page = page;//+++
+//   req->src = buf_read;//+++
+//   req->crc_compress = entry->crc_compress;//+++ 用于解压缩校验
+//   req->crc_uncompress = entry->crc_uncompress;//+++ 用于解压缩校验
+//   req->cqe.done = sswap_rdma_read_done;
+//   ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_READ);
+
+//   sswap_rdma_wait_completion(q->cq, req);//等待read done完成
+
+//   //******** 解压缩 **************
+//   // p = (char *)req->src;
+//   // for(i = 0; i < req->len; i++){
+//   //   printk("%02X ", p[i]);
+//   // }
+//   //******** compress 测试 **************
+
+  
+//   dst = kmap_atomic(req->page);//
+//   crc_r = crc16(0x0000 , req->src, req->len);//对读数据进行校验
+
+// //******** v3 alloc free **************
+//   pr_info("------ decompress alloc free --------");
+  
+//   tfm = crypto_alloc_comp(alg,0,0);
+//   decompress_ret = crypto_comp_decompress(tfm, req->src, req->len, dst, &slen); 
+//   crypto_free_comp(tfm);     
+
+//   crc_r_decompress = crc16(0x0000, dst, slen);
+
+//   pr_info("[done back] decompress cpuid: %d len: %zu --> %d crc: %hx --> %hx ret: %d",smp_processor_id(), req->len, slen, crc_r, crc_r_decompress, decompress_ret);
+
+//  //******** v4 _tfm **************  未通过 len --> 0 ret: -22
+
+//   pr_info("------ decompress _tfm --------");
+//   tfm = _tfm;
+//   decompress_ret = crypto_comp_decompress(_tfm, req->src, req->len, dst, &slen);      
+
+//   crc_r_decompress = crc16(0x0000, dst, slen);
+
+//   pr_info("[done back] decompress cpuid: %d len: %zu --> %d crc: %hx --> %hx ret: %d",smp_processor_id(), req->len, slen, crc_r, crc_r_decompress, decompress_ret);
+
+//   // compress_test_v3();//++++++
+// //******** v5 tfm_percpu ************** 未通过 len --> 0 ret: -22
+
+//   pr_info("------ decompress tfm_percpu --------");
+//   tfm = *get_cpu_ptr(tfm_percpu);
+//   // tfm = *per_cpu_ptr(tfm_percpu, get_cpu());
+//   decompress_ret = crypto_comp_decompress(tfm, req->src, req->len, dst, &slen);
+//   // put_cpu();
+// 	put_cpu_ptr(tfm_percpu);
+//   crc_r_decompress = crc16(0x0000, dst, slen);
+  
+//   pr_info("[done back] decompress cpuid: %d len: %zu --> %d crc: %hx --> %hx ret: %d",smp_processor_id(), req->len, slen, crc_r, crc_r_decompress, decompress_ret);
+
+//   decompress_buf_read_alloc_free(req);//++++
+//   decompress_buf_read_tfm(req);//++++
+//   decompress_buf_read_tfm_percpu(req);//+++++
+
+
+
+//   kmem_cache_free(req_cache, req);//不能提前释放
+//   kunmap_atomic(dst);
+//   kfree(req->src);
+
+//   // __free_pages(page, get_order(PAGE_SIZE));
+//   // SetPageUptodate(req->page);
+//   // unlock_page(req->page);
+//   return ret;
+// }
 
 static inline int begin_read_lzo(struct rdma_queue *q, struct page *page,
 			     u64 roffset)
@@ -2126,6 +2198,7 @@ static int pingpong_test(void){
 
 
   //******** 写 **************
+  pr_info("[write] %s", (char *)src);
   dev = q_write->ctrl->rdev->dev;//dev应该可以共享
 
   while ((inflight = atomic_read(&q_write->pending)) >= QP_MAX_SEND_WR - 8) {
@@ -2166,12 +2239,228 @@ static int pingpong_test(void){
 
   sswap_rdma_wait_completion(q_read->cq, req_read);//等待read_done 完成 complete(&req->done);
 
-  pr_info("[done back] %s", (char *)dst);
+  pr_info("[read done back] %s", (char *)dst);
 
   kfree(src);
   kfree(dst);
 
   return ret;
+}
+
+static void sswap_rdma_read_pagebuf_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+  struct rdma_req *req =
+    container_of(wc->wr_cqe, struct rdma_req, cqe);
+  struct rdma_queue *q = cq->cq_context;
+  struct ib_device *ibdev = q->ctrl->rdev->dev;
+  void *dst;
+
+
+  if (unlikely(wc->status != IB_WC_SUCCESS))
+    pr_err("sswap_rdma_read_done status is not success, it is=%d\n", wc->status);
+
+  ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_FROM_DEVICE);
+  dst = kmap_atomic(req->page);
+  memcpy(dst, req->src, req->len);
+  kunmap_atomic(dst);
+
+
+  complete(&req->done);
+  atomic_dec(&q->pending);
+
+  SetPageUptodate(req->page);
+  unlock_page(req->page);
+  kfree(req->src);
+  kmem_cache_free(req_cache, req);
+}
+
+static inline int rdma_read_pagebuf(struct rdma_queue *q, struct page *page,
+			     u64 roffset)
+{
+  struct rdma_req *req;
+  struct ib_device *dev = q->ctrl->rdev->dev;
+  struct ib_sge sge = {};
+  int ret, inflight;
+  void *buf_read;
+
+  /* back pressure in-flight reads, can't send more than
+   * QP_MAX_SEND_WR at a time */
+  while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR) {
+    BUG_ON(inflight > QP_MAX_SEND_WR); /* only valid case is == */
+    poll_target(q, 8);
+    pr_info_ratelimited("back pressure happened on reads");
+  }
+
+  // ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
+
+  buf_read = kmalloc(PAGE_SIZE, GFP_KERNEL);//作为read buf
+  if(buf_read == NULL){
+    pr_err("kmalloc wrong!!!");
+    BUG();
+  }
+  ret = get_req_for_buf(&req, dev, buf_read, PAGE_SIZE, DMA_FROM_DEVICE);
+
+  if (unlikely(ret))
+    return ret;
+
+  req->len = PAGE_SIZE;
+  req->roffset = roffset;//+++++
+  req->page = page;//+++
+  req->src = buf_read;//+++ done释放
+
+  req->cqe.done = sswap_rdma_read_pagebuf_done;
+  ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_READ);
+  return ret;
+}
+
+static void sswap_rdma_write_pagebuf_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+  struct rdma_req *req =
+    container_of(wc->wr_cqe, struct rdma_req, cqe);
+  struct rdma_queue *q = cq->cq_context;
+  struct ib_device *ibdev = q->ctrl->rdev->dev;
+
+  if (unlikely(wc->status != IB_WC_SUCCESS)) {
+    pr_err("sswap_rdma_write_done status is not success, it is=%d\n", wc->status);
+    //q->write_error = wc->status;
+  }
+  // ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_TO_DEVICE);
+  ib_dma_unmap_single(ibdev, req->dma, PAGE_SIZE, DMA_TO_DEVICE);
+
+  complete(&req->done);//添加写同步
+
+  kfree(req->src);
+  atomic_dec(&q->pending);
+  kmem_cache_free(req_cache, req);
+}
+
+
+static inline int rdma_write_pagebuf(struct rdma_queue *q, struct page *page,
+				  u64 roffset)
+{
+  struct rdma_req *req;
+  struct ib_device *dev = q->ctrl->rdev->dev;
+  struct ib_sge sge = {};
+  int ret, inflight;
+  void* src;
+
+  while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR - 8) {
+    BUG_ON(inflight > QP_MAX_SEND_WR);
+    poll_target(q, 2048);
+    pr_info_ratelimited("back pressure writes");
+  }
+  src = kmap_atomic(page);
+
+  ret = get_req_for_buf(&req, dev, src, PAGE_SIZE, DMA_TO_DEVICE);//设置req中地址dma 长度len
+  req->len = PAGE_SIZE;
+  // ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
+  if (unlikely(ret))
+    return ret;
+
+  req->cqe.done = sswap_rdma_write_pagebuf_done;
+  ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_WRITE);
+  return ret;
+}
+
+
+
+static int pingpong_page_test(void){
+  int ret = 0;
+  struct rdma_queue *q_read, *q_write;
+  int inflight, buflen, half_buflen;
+  void *src = NULL, *dst = NULL;
+  u16 crc_w, crc_r;
+  u64 roffset = 0x0;
+  
+  struct page *page = NULL;
+  struct page *page_read = NULL;
+  struct rdma_req *req_write, *req_read;
+  
+
+  //page -[map]-> src -[cp]-> buf_write -[写读]-> buf_read -[dcp]-> dst <-[map]- page
+  //crc_w --> crc_w_compress --> crc_r --> crc_r_decompress
+
+  buflen = 4096;
+  half_buflen = buflen / 2;
+  
+  page = alloc_pages(GFP_KERNEL, get_order(buflen));
+  if (!page) {
+    printk(KERN_ERR "Failed to allocate %d bytes of memory\n", buflen);
+    goto out;
+  }
+  page_read = alloc_pages(GFP_KERNEL, get_order(buflen));
+  if (!page_read) {
+    printk(KERN_ERR "Failed to allocate %d bytes of memory\n", buflen);
+    goto out;
+  }
+
+  
+  // src -[cp]-> buf_write --> buf_read -[dcp]-> dst
+  pr_info("*********** begin pingpong page test *********");
+
+  // src = kmalloc(2 * buflen, GFP_KERNEL);
+  src = kmap_atomic(page);//映射page到Kernel va作为compress的源地址
+  
+  //设置数据一半相同数据 一半随机数
+  memset(src, 7, buflen);
+  // memset(dst, 7, buflen);
+
+  // get_random_bytes(src + half_buflen, half_buflen); //设置随机数 会有问题 大部分 都不能压缩 4096 --> 4116
+
+
+  crc_w = crc16(0x0000, src, PAGE_SIZE);
+  // compress(src, buflen, buf_write, &dlen);// buflen --> dlen
+  // crc_w_compress = crc16(0x0000, buf_write, dlen);
+
+
+  kunmap_atomic(src);
+
+  pr_info("crc: %hx", crc_w);
+
+
+  q_write = &(gctrl->queues[0]);//直接用第1个和第2个queue
+  q_read = &(gctrl->queues[1]);
+
+
+  //******** 写 **************
+
+  // ret = rdma_write_pagebuf(q_write, page, roffset);//直接写
+  req_write = write_queue_add_syn(q_write, page, roffset);
+  BUG_ON(ret);
+  drain_queue(q_write);
+
+  sswap_rdma_wait_completion(q_write->cq, req_write);//ib_process_cq_direct(cq, 1);
+
+  //******** 读 **************
+  // ret = rdma_read_pagebuf(q_read, page_read, roffset);
+  req_read = begin_read_syn(q_read, page_read, roffset);
+
+  sswap_rdma_wait_completion(q_read->cq, req_read);//等待read_done 完成 complete(&req->done);
+  //******** 验证 **************
+  //这里验证done decompress处理是否正确
+  // pr_info("************************");
+  dst = kmap_atomic(page_read);//检查done返回的page中数据是否正确,是否和初始值相同
+
+
+  crc_r = crc16(0x0000, dst, PAGE_SIZE);
+
+  //buflen -> dlen -> slen
+
+
+  pr_info("read crc: %hx", crc_r);
+  kunmap_atomic(dst);
+  kmem_cache_free(req_cache, req_write);
+  kmem_cache_free(req_cache, req_read);
+
+
+out:
+  // kfree(src);
+  __free_pages(page, get_order(buflen));
+  __free_pages(page_read, get_order(buflen));
+
+  return ret;
+
+
 }
 
 static int pingpong_test_compress(void){
@@ -3854,19 +4143,20 @@ static int __init sswap_rdma_init_module(void)
   init_tfm_percpu();
   pr_info("ctrl is ready for reqs\n");
 
-  _tfm = crypto_alloc_comp(_alg,0,0);
+  // _tfm = crypto_alloc_comp(_alg,0,0);
 
-  if (IS_ERR_OR_NULL(_tfm)) {
-    pr_err("could not alloc crypto comp");
-    BUG();
-  }
+  // if (IS_ERR_OR_NULL(_tfm)) {
+  //   pr_err("could not alloc crypto comp");
+  //   BUG();
+  // }
 
   //******** ping_pong测试 **************
   // compress_test();
   // compress_test_v1();
   // compress_test_v2();
   // compress_test_v2();
-  // pingpong_test(); 
+  pingpong_test(); 
+  pingpong_page_test();
   // pingpong_test_compress();
   // pingpong_test_compress_page();
   // pingpong_test_compress_page_rbtree();
@@ -3875,12 +4165,12 @@ static int __init sswap_rdma_init_module(void)
   // compress_test_v3();
 
   // pingpong_test_compress_check_page_rbtree_wait(HALF_RANDOM);
-  pingpong_test_compress_check_page_rbtree_wait_lzo(HALF_RANDOM);
-  pingpong_test_compress_fastswap(HALF_RANDOM);
+  // pingpong_test_compress_check_page_rbtree_wait_lzo(HALF_RANDOM);
+  // pingpong_test_compress_fastswap(HALF_RANDOM);
 
-  crypto_free_comp(_tfm);//释放crypto_comp对象
+  // crypto_free_comp(_tfm);//释放crypto_comp对象
 
-  destroy_tfm_percpu();
+  // destroy_tfm_percpu();
   pr_info("ping pong test done");
     
 
