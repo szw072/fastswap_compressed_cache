@@ -26,7 +26,7 @@ module_param_named(nc, numcpus, int, 0644);//numqueues = numcpus * 3 = 60;
 module_param_string(sip, serverip, INET_ADDRSTRLEN, 0644);
 module_param_string(cip, clientip, INET_ADDRSTRLEN, 0644);
 
-static void *drambuf;
+static void *dram_compressed_buf, *dram_buf;
 static struct swap_trend trend_history;
 static struct time_log decomrpess_time_history;
 static struct time_log rdma_time_history;
@@ -45,7 +45,13 @@ static struct compress_data example_compress_data;
 #define CQ_NUM_CQES	(QP_MAX_SEND_WR)
 #define POLL_BATCH_HIGH (QP_MAX_SEND_WR / 4)
 #define ONEGB (1024UL*1024*1024)
-#define REMOTE_BUF_SIZE (ONEGB * 20) /* must match what server is allocating */
+#define REMOTE_BUF_SIZE (ONEGB * 10) /* must match what server is allocating */
+
+// 32MB
+// unsigned long buffer_size = 8000;//32MB
+// unsigned long buffer_size = 50000;//200MB
+unsigned long buffer_size = 75000;//300MB
+// unsigned long buffer_size = 100000;//400MB
 
 struct zswap_entry {
 	struct rb_node rbnode;
@@ -924,31 +930,31 @@ static int sswap_rdma_create_ctrl(struct sswap_rdma_ctrl **c)
 
 
 
-static void sswap_rdma_write_done_compress(struct ib_cq *cq, struct ib_wc *wc)
-{
-  struct rdma_req *req =
-    container_of(wc->wr_cqe, struct rdma_req, cqe);
-  struct rdma_queue *q = cq->cq_context;
-  struct ib_device *ibdev = q->ctrl->rdev->dev;
-  // size_t page_len = PAGE_SIZE;
+// static void sswap_rdma_write_done_compress(struct ib_cq *cq, struct ib_wc *wc)
+// {
+//   struct rdma_req *req =
+//     container_of(wc->wr_cqe, struct rdma_req, cqe);
+//   struct rdma_queue *q = cq->cq_context;
+//   struct ib_device *ibdev = q->ctrl->rdev->dev;
+//   // size_t page_len = PAGE_SIZE;
 
-  if (unlikely(wc->status != IB_WC_SUCCESS)) {
-    pr_err("sswap_rdma_write_done status is not success, it is=%d\n", wc->status);
-    //q->write_error = wc->status;
-  }
-  // ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_TO_DEVICE);// 修改接口后这里 req->dma 是page kmap到的内核虚拟地址 
-  ib_dma_unmap_single(ibdev, req->dma, req->len, DMA_TO_DEVICE);
+//   if (unlikely(wc->status != IB_WC_SUCCESS)) {
+//     pr_err("sswap_rdma_write_done status is not success, it is=%d\n", wc->status);
+//     //q->write_error = wc->status;
+//   }
+//   // ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_TO_DEVICE);// 修改接口后这里 req->dma 是page kmap到的内核虚拟地址 
+//   ib_dma_unmap_single(ibdev, req->dma, req->len, DMA_TO_DEVICE);
 
-  // pr_info("[write done] cpuid: %d offset: %llx len: %zu --> %zu crc: %hx --> %hx", smp_processor_id(), req->roffset, page_len, req->len, req->crc_uncompress, req->crc_compress);
+//   // pr_info("[write done] cpuid: %d offset: %llx len: %zu --> %zu crc: %hx --> %hx", smp_processor_id(), req->roffset, page_len, req->len, req->crc_uncompress, req->crc_compress);
 
-  complete(&req->done);//添加写同步
+//   complete(&req->done);//添加写同步
 
 
-  atomic_dec(&q->pending);
-  kfree(req->src);//释放write buf
-  kmem_cache_free(req_cache, req);
-  // kfree(req);
-}
+//   atomic_dec(&q->pending);
+//   kfree(req->src);//释放write buf
+//   kmem_cache_free(req_cache, req);
+//   // kfree(req);
+// }
 
 static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
 {
@@ -1317,7 +1323,7 @@ int dram_read_compress(struct rdma_queue *q, struct page *page, u64 roffset, str
 
   
 	page_vaddr = kmap_atomic(page);
-  src = drambuf + roffset;
+  src = dram_compressed_buf + roffset;
 
   if(entry->length == PAGE_SIZE){
     memcpy(page_vaddr, src, PAGE_SIZE);
@@ -1343,7 +1349,7 @@ int dram_read(struct rdma_queue *q, struct page *page, u64 roffset){
   void *page_vaddr;
 
 	page_vaddr = kmap_atomic(page);
-	copy_page(page_vaddr, (void *) (drambuf + roffset));
+	copy_page(page_vaddr, (void *) (dram_buf + roffset));
 	kunmap_atomic(page_vaddr);
 
   //******** 更新 + unlock page **************
@@ -1461,10 +1467,7 @@ int find_trend (int *depth, long *major_delta, int *major_count) {
 * prefetch buffer functions
 **********************************/
 
-// 32MB
-// unsigned long buffer_size = 8000;//32MB
-// unsigned long buffer_size = 50000;//200MB
-unsigned long buffer_size = 100000;//400MB
+
 unsigned long is_prefetch_buffer_active = 0;
 
 struct local_buf {
@@ -1546,11 +1549,16 @@ void add_page_to_buffer(struct zswap_entry* entry){
     
     //删除缓存 entry字段设成false
     page_entry = local_buffer.page_list[head];
-    page_entry->cached = false;
+    if(page_entry != NULL){
+      page_entry->cached = false;
+    }
 
     //******** 从rb tree中删除 **************
     // zswap_rb_erase(&tree->rbroot, page_entry);
+
     // pr_info("** delete from page list %lx", entry->offset);
+
+
 		inc_buffer_head();
     dec_buffer_size();
 	}
@@ -1696,8 +1704,12 @@ int rdma_read_compress(struct rdma_queue *q, struct page *page, u64 roffset,
 
   return ret;
 }
+bool is_l1_hit(void){
+  return true;
+}
 
 bool is_buffer_faster(void){
+  return false;
   if(atomic64_read(&decomrpess_time_history.average_time) <= atomic64_read(&rdma_time_history.average_time)){
     return true;
   }
@@ -1729,12 +1741,16 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
 
   //******** 检查缓存 **************
   //1.缓存命中 2.读local buffer更快（考虑解压缩开销，相比rdma读）
-  if((entry != NULL && entry->cached == true) && is_buffer_faster()){//缓存在local
-    //******** dram读 **************
-    // pr_info("cache hit %lx", entry->offset);
+  // entry->cached = false;
+  if((entry != NULL && entry->cached == true) && is_l1_hit()){
+    ret = dram_read(q, page, roffset);
     atomic64_inc(&cachehit_pages);
+  }
+  else if((entry != NULL && entry->cached == true) && is_buffer_faster()){
+    //******** dram读 **************
     ret = dram_read_compress(q, page, roffset, entry);//rdma读请求后 接dram读
-    // ret = dram_read(q, page, roffset);//rdma读请求后 接dram读
+
+    atomic64_inc(&cachehit_pages);
   } else {
     //******** rdma读 **************
     ret = rdma_read_page(q, page, roffset);
@@ -1759,7 +1775,7 @@ int dram_write(struct page *page, u64 roffset)
 	page_vaddr = kmap_atomic(page);
 
 
-	copy_page((void *) (drambuf + roffset), page_vaddr);
+	copy_page((void *) (dram_buf + roffset), page_vaddr);
 	kunmap_atomic(page_vaddr);
 	return 0;
 }
@@ -1803,7 +1819,7 @@ int dram_write_compress(struct page *page, u64 roffset)
   }
 
 	// copy_page((void *) (drambuf + roffset), page_vaddr);
-  memcpy((void *) (drambuf + roffset), src, wlen);
+  memcpy((void *) (dram_compressed_buf + roffset), src, wlen);
 
 	kunmap_atomic(page_vaddr);
   kfree(wrkmem);
@@ -1894,6 +1910,8 @@ static inline int begin_write(struct rdma_queue *q, struct page *page,
 
   //******** dram写 **************
   ret = dram_write_compress(page, roffset);//写缓存 + 插入rbtree
+  ret = dram_write(page, roffset);
+  
   return ret;
 }
 
@@ -2049,9 +2067,14 @@ static int __init sswap_rdma_init_module(void)
   init_rbtree();
 
 
-  //******** 申请dram内存 **************
-  drambuf = vzalloc(REMOTE_BUF_SIZE);//30GB
-	pr_info("vzalloc'ed %lu bytes for dram backend\n", REMOTE_BUF_SIZE);
+  //******** 申请dram compress buf 内存 **************
+  dram_compressed_buf = vzalloc(REMOTE_BUF_SIZE);
+	pr_info("vzalloc'ed %lu bytes for dram compressed buf\n", REMOTE_BUF_SIZE);
+
+  //******** 申请dram buf 内存 **************
+  dram_buf = vzalloc(REMOTE_BUF_SIZE);
+	pr_info("vzalloc'ed %lu bytes for dram buf\n", REMOTE_BUF_SIZE);
+
 
   //******** 初始化缓存 **************
   prefetch_buffer_init(buffer_size);
@@ -2074,7 +2097,7 @@ static void __exit sswap_rdma_cleanup_module(void)
 {
   pr_info("rdma sample time: %ld", atomic64_read(&rdma_time_history.average_time));
   pr_info("decompress sample time: %ld", atomic64_read(&decomrpess_time_history.average_time));
-  pr_info("[cache] total: %ld  cache hit: %ld", atomic64_read(&total_pages),  atomic64_read(&cachehit_pages));
+  pr_info("[cache] cache hit: %ld / %ld", atomic64_read(&cachehit_pages), atomic64_read(&total_pages));
   pr_info("[trend] head: %d size: %d maxsize: %d", atomic_read(&trend_history.head), atomic_read(&trend_history.size), atomic_read(&trend_history.max_size));
   pr_info("[prefetch buf] head: %d tail: %d size: %d", atomic_read(&local_buffer.head), atomic_read(&local_buffer.tail), atomic_read(&local_buffer.size));
   
@@ -2087,7 +2110,8 @@ static void __exit sswap_rdma_cleanup_module(void)
   }
   zswap_frontswap_invalidate_area();
   //drambuf 和 缓存list
-  vfree(drambuf);
+  vfree(dram_compressed_buf);
+  vfree(dram_buf);
 
   //******** 释放free_prefetchbuf和trend_history **************
   pr_info("free trend history");
